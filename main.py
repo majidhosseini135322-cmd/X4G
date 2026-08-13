@@ -636,8 +636,8 @@ async def api_change_password(request: Request, token=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
     AUTH["password_hash"] = hash_password(new)
     async with SESSIONS_LOCK:
-        await destroy_session(token)
-        await create_session()
+       # await destroy_session(token)
+       # await create_session()
     await save_state()
     log_activity("auth", "رمز عبور پنل تغییر کرد", "ok")
     return {"ok": True}
