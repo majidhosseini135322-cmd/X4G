@@ -108,44 +108,174 @@ def log_activity(kind: str, message: str, level: str = "info"):
     })
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Auth ──────────────────────────────────────────────────────────────────────
 SESSION_COOKIE = "x4g_session"
 SESSION_TTL = 60 * 60 * 24 * 7
+
+# Upstash Redis configuration
+UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
+UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+
+# Local fallback for non-serverless environments
+SESSIONS: dict = {}
+SESSIONS_LOCK = asyncio.Lock()
+
 
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456"))}
-SESSIONS: dict = {}
-SESSIONS_LOCK = asyncio.Lock()
+
+AUTH = {
+    "password_hash": hash_password(
+        os.environ.get("ADMIN_PASSWORD", "123456")
+    )
+}
+
+
+async def redis_command(command: list):
+    """
+    Execute a Redis command through Upstash REST API.
+
+    Example:
+        ["SET", "key", "value", "EX", 3600]
+        ["GET", "key"]
+        ["DEL", "key"]
+    """
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return None
+
+    try:
+        if http_client is None:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(
+                    UPSTASH_REDIS_REST_URL,
+                    headers={
+                        "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
+                        "Content-Type": "application/json",
+                    },
+                    json=command,
+                )
+        else:
+            response = await http_client.post(
+                UPSTASH_REDIS_REST_URL,
+                headers={
+                    "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json=command,
+            )
+
+        response.raise_for_status()
+        data = response.json()
+        return data.get("result")
+
+    except Exception as e:
+        logger.error(f"Redis error: {e}")
+        return None
+
 
 async def create_session() -> str:
     token = secrets.token_urlsafe(32)
+    expires_at = int(time.time()) + SESSION_TTL
+
+    # Use Redis when configured (Vercel/serverless)
+    if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
+        key = f"x4g:session:{token}"
+
+        result = await redis_command([
+            "SET",
+            key,
+            str(expires_at),
+            "EX",
+            SESSION_TTL,
+        ])
+
+        if result != "OK":
+            raise HTTPException(
+                status_code=503,
+                detail="Session storage unavailable",
+            )
+
+        return token
+
+    # Local fallback
     async with SESSIONS_LOCK:
-        SESSIONS[token] = time.time() + SESSION_TTL
+        SESSIONS[token] = expires_at
+
     return token
+
 
 async def is_valid_session(token: str | None) -> bool:
     if not token:
         return False
+
+    # Use Redis when configured
+    if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
+        key = f"x4g:session:{token}"
+
+        result = await redis_command([
+            "GET",
+            key,
+        ])
+
+        if result is None:
+            return False
+
+        try:
+            expires_at = int(result)
+
+            if expires_at < int(time.time()):
+                await redis_command([
+                    "DEL",
+                    key,
+                ])
+                return False
+
+            return True
+
+        except (ValueError, TypeError):
+            return False
+
+    # Local fallback
     async with SESSIONS_LOCK:
         exp = SESSIONS.get(token)
+
         if exp is None:
             return False
+
         if exp < time.time():
             SESSIONS.pop(token, None)
             return False
+
         return True
+
 
 async def destroy_session(token: str | None):
     if not token:
         return
+
+    # Use Redis when configured
+    if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
+        await redis_command([
+            "DEL",
+            f"x4g:session:{token}",
+        ])
+        return
+
+    # Local fallback
     async with SESSIONS_LOCK:
         SESSIONS.pop(token, None)
 
+
 async def require_auth(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
+
     if not await is_valid_session(token):
-        raise HTTPException(status_code=401, detail="unauthorized")
+        raise HTTPException(
+            status_code=401,
+            detail="unauthorized",
+        )
+
     return token
 
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
@@ -506,8 +636,8 @@ async def api_change_password(request: Request, token=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
     AUTH["password_hash"] = hash_password(new)
     async with SESSIONS_LOCK:
-        SESSIONS.clear()
-        SESSIONS[token] = time.time() + SESSION_TTL
+        await destroy_session(token)
+        await create_session()
     await save_state()
     log_activity("auth", "رمز عبور پنل تغییر کرد", "ok")
     return {"ok": True}
