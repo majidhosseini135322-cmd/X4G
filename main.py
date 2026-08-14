@@ -42,41 +42,162 @@ app.add_middleware(
 # ── Persistence ───────────────────────────────────────────────────────────────
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_FILE = DATA_DIR / "x4g_state.json"
+
+STATE_REDIS_KEY = "x4g:state:v1"
+
 SAVE_LOCK = asyncio.Lock()
+
+
+def _state_payload() -> dict:
+    return {
+        "links": dict(LINKS),
+        "subs": dict(SUBS),
+        "password_hash": AUTH["password_hash"],
+        "saved_at": datetime.now().isoformat(),
+    }
+
 
 async def load_state():
     global LINKS, AUTH, SUBS
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if DATA_FILE.exists():
-            async with aiofiles.open(DATA_FILE, "r", encoding="utf-8") as f:
-                raw = await f.read()
-            data = json.loads(raw)
-            LINKS.update(data.get("links", {}))
-            SUBS.update(data.get("subs", {}))
-            if "password_hash" in data:
-                AUTH["password_hash"] = data["password_hash"]
-            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs")
-    except Exception as e:
-        logger.warning(f"Could not load state: {e}")
+
+    data = None
+
+    # ── Primary storage: Upstash Redis ────────────────────────────────────────
+    if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
+        try:
+            raw = await redis_command(["GET", STATE_REDIS_KEY])
+
+            if raw:
+                data = json.loads(raw)
+                logger.info("State loaded from Upstash Redis")
+
+        except Exception as e:
+            logger.warning(f"Could not load state from Redis: {e}")
+
+    # ── Local fallback / migration ────────────────────────────────────────────
+    if data is None:
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+            if DATA_FILE.exists():
+                async with aiofiles.open(
+                    DATA_FILE,
+                    "r",
+                    encoding="utf-8"
+                ) as f:
+                    raw = await f.read()
+
+                data = json.loads(raw)
+                logger.info("State loaded from local file")
+
+        except Exception as e:
+            logger.warning(f"Could not load local state: {e}")
+
+    # ── Apply state ───────────────────────────────────────────────────────────
+    if data is not None:
+        LINKS.clear()
+        SUBS.clear()
+
+        LINKS.update(data.get("links", {}))
+        SUBS.update(data.get("subs", {}))
+
+        if data.get("password_hash"):
+            AUTH["password_hash"] = data["password_hash"]
+
+        logger.info(
+            f"State loaded: {len(LINKS)} links, {len(SUBS)} subs"
+        )
+
+        # If Redis was empty and we loaded an old local state,
+        # migrate it to Redis.
+        if (
+            UPSTASH_REDIS_REST_URL
+            and UPSTASH_REDIS_REST_TOKEN
+        ):
+            try:
+                await redis_command([
+                    "SET",
+                    STATE_REDIS_KEY,
+                    json.dumps(
+                        data,
+                        ensure_ascii=False,
+                        separators=(",", ":")
+                    ),
+                ])
+                logger.info("Local state migrated to Upstash Redis")
+            except Exception as e:
+                logger.warning(
+                    f"Could not migrate local state to Redis: {e}"
+                )
+
 
 async def save_state():
     async with SAVE_LOCK:
+        data = _state_payload()
+        raw = json.dumps(
+            data,
+            ensure_ascii=False,
+            separators=(",", ":")
+        )
+
+        # ── Primary storage: Upstash Redis ────────────────────────────────────
+        if (
+            UPSTASH_REDIS_REST_URL
+            and UPSTASH_REDIS_REST_TOKEN
+        ):
+            try:
+                result = await redis_command([
+                    "SET",
+                    STATE_REDIS_KEY,
+                    raw,
+                ])
+
+                if result != "OK":
+                    raise RuntimeError(
+                        f"Redis SET failed: {result}"
+                    )
+
+                logger.info(
+                    f"State saved to Redis: "
+                    f"{len(LINKS)} links, {len(SUBS)} subs"
+                )
+
+                return
+
+            except Exception as e:
+                logger.error(
+                    f"Could not save state to Redis: {e}"
+                )
+
+                # Do not silently pretend the state was saved.
+                raise
+
+        # ── Local fallback ───────────────────────────────────────────────────
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
-            data = {
-                "links": dict(LINKS),
-                "subs": dict(SUBS),
-                "password_hash": AUTH["password_hash"],
-                "saved_at": datetime.now().isoformat(),
-            }
-            tmp = DATA_FILE.with_suffix(".tmp")
-            async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
-                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
-            tmp.replace(DATA_FILE)
-        except Exception as e:
-            logger.warning(f"Could not save state: {e}")
 
+            tmp = DATA_FILE.with_suffix(".tmp")
+
+            async with aiofiles.open(
+                tmp,
+                "w",
+                encoding="utf-8"
+            ) as f:
+                await f.write(
+                    json.dumps(
+                        data,
+                        ensure_ascii=False,
+                        indent=2
+                    )
+                )
+
+            tmp.replace(DATA_FILE)
+
+        except Exception as e:
+            logger.warning(
+                f"Could not save local state: {e}"
+            )
+            raise
 # ── In-memory state ───────────────────────────────────────────────────────────
 connections: dict = {}
 stats = {
@@ -474,7 +595,7 @@ async def create_sub(request: Request, _=Depends(require_auth)):
             "created_at": datetime.now().isoformat(),
             "link_ids": [],
         }
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("sub", f"گروه «{name}» ساخته شد", "ok")
     host = get_host()
     return {
@@ -527,7 +648,7 @@ async def update_sub(sub_id: str, request: Request, _=Depends(require_auth)):
             s["password_hash"] = hash_password(pw) if pw else None
         if "link_ids" in body:
             s["link_ids"] = list(body["link_ids"])
-    asyncio.create_task(save_state())
+    await save_state()
     return {"ok": True}
 
 @app.delete("/api/subs/{sub_id}")
@@ -541,7 +662,7 @@ async def delete_sub(sub_id: str, _=Depends(require_auth)):
         for link in LINKS.values():
             if link.get("sub_id") == sub_id:
                 link["sub_id"] = None
-    asyncio.create_task(save_state())
+   await save_state()
     log_activity("sub", f"گروه «{name}» حذف شد", "warn")
     return {"ok": True, "deleted": sub_id}
 
@@ -564,7 +685,7 @@ async def assign_link_to_sub(sub_id: str, request: Request, _=Depends(require_au
     async with LINKS_LOCK:
         if link_id in LINKS:
             LINKS[link_id]["sub_id"] = sub_id if action == "add" else None
-    asyncio.create_task(save_state())
+    await save_state()
     return {"ok": True}
 
 # ── Public sub-group subscription file ───────────────────────────────────────
@@ -765,7 +886,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
                 if uid not in ids:
                     ids.append(uid)
 
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("link", f"کانفیگ «{label}» ساخته شد", "ok")
     host = get_host()
     return {
@@ -838,7 +959,7 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
                 if uid not in ids:
                     ids.append(uid)
 
-    asyncio.create_task(save_state())
+    await save_state()
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
@@ -855,7 +976,7 @@ async def delete_link(uid: str, _=Depends(require_auth)):
                 ids = SUBS[sub_id].get("link_ids", [])
                 if uid in ids:
                     ids.remove(uid)
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("link", f"کانفیگ «{label}» حذف شد", "err")
     return {"ok": True, "deleted": uid}
 
