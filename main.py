@@ -656,14 +656,19 @@ async def delete_sub(sub_id: str, _=Depends(require_auth)):
     async with SUBS_LOCK:
         if sub_id not in SUBS:
             raise HTTPException(status_code=404, detail="sub not found")
+
         name = SUBS[sub_id].get("name", sub_id)
         del SUBS[sub_id]
+
     async with LINKS_LOCK:
         for link in LINKS.values():
             if link.get("sub_id") == sub_id:
                 link["sub_id"] = None
-   await save_state()
+
+    await save_state()
+
     log_activity("sub", f"گروه «{name}» حذف شد", "warn")
+
     return {"ok": True, "deleted": sub_id}
 
 @app.post("/api/subs/{sub_id}/links")
